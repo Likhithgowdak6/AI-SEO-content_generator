@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 
 # -------------------- CONFIG --------------------
-HF_API_KEY = "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"  # optional: replace with your key
+HF_API_KEY = "Your-Api-key"  # optional: replace with your key
 API_URL = "https://api.groq.com/openai/v1/chat/completions"
 HEADERS = {"Authorization": f"Bearer {HF_API_KEY}", "Content-Type": "application/json"}
 
@@ -714,4 +714,5 @@ def generate_reviews_from_text(raw_text: str, count: int):
     return json.dumps(reviews, indent=2, ensure_ascii=False), reviews
 
 # Module ends here. This file is intended to be imported by main.py
+
 
