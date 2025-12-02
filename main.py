@@ -50,7 +50,7 @@ app.add_middleware(
 
 # ============= CONFIGURATION =============
 
-GROQ_API_KEY = "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"
+GROQ_API_KEY = "Your-API-Key"
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 # Company callback API - Direct URL (no environment variable)
@@ -984,3 +984,4 @@ if __name__ == "__main__":
         timeout_keep_alive=180,
         limit_concurrency=10
     )
+
