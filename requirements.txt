@@ -1,0 +1,32 @@
+# Web framework + ASGI server
+fastapi==0.122.0
+uvicorn[standard]==0.27.0
+
+# Requesting HTTP APIs
+requests==2.32.3
+python-dotenv==1.0.1
+python-multipart==0.0.9
+aiofiles==24.1.0
+anyio==4.11.0
+
+# Data models / typing
+pydantic==2.12.4
+typing-extensions==4.15.0
+
+# Data / utilities
+numpy==2.3.5
+pandas==2.3.3
+pillow==11.3.0
+PyYAML==6.0.3
+tqdm==4.67.1
+rich==14.2.0
+
+# Media/audio (used in your original list)
+ffmpy==1.0.0
+pydub==0.25.1
+
+# Optional / helpful tooling
+huggingface_hub==1.1.5
+httpx==0.28.1
+sniffio==1.3.1
+packaging==25.0
