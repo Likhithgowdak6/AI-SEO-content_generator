@@ -1,9 +1,11 @@
-# main.py - Enhanced API-Driven Property Content Generator with FAQ Generation (Part 1)
+# main.py - Enhanced API-Driven Property Content Generator (Part 1)
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, validator, ValidationError
 from typing import List, Optional, Dict, Any
 import os
+from datetime import datetime
+from pathlib import Path
 from datetime import datetime
 import json
 import re
@@ -16,6 +18,7 @@ import random
 import time
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from urllib.parse import quote_plus
 from openai import OpenAI
 
 # Import review generator
@@ -25,21 +28,15 @@ except ImportError:
     print("⚠️  app.py not found. Review generation will be skipped.")
     generate_reviews_from_text = None
 
-# Import content enhancer
-try:
-    from loc_build import enhance_property_content
-except ImportError:
-    print("⚠️  loc_build.py not found. Content enhancement will be skipped.")
-    enhance_property_content = None
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="Property Content Generator API - Automated with FAQ",
-    description="Receives data via POST, generates SEO content + reviews + FAQs, sends back automatically",
-    version="7.0.0"
+    title="Property Content Generator API - Enhanced",
+    description="Smart content generation with word count validation and conditional generation",
+    version="9.0.0"
 )
 
 app.add_middleware(
@@ -49,6 +46,63 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ============= WEB SCRAPER (Integrated from loc_build.py) =============
+
+class SimpleGoogleScraper:
+    """Handles simple Google scraping - fast and minimal"""
+    
+    def __init__(self):
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        self.session = requests.Session()
+        self.session.headers.update(self.headers)
+    
+    def quick_google_search(self, query: str, max_results: int = 2) -> str:
+        try:
+            encoded_query = quote_plus(query)
+            url = f"https://www.google.com/search?q={encoded_query}"
+            
+            response = self.session.get(url, timeout=5)
+            
+            if response.status_code != 200:
+                logger.warning(f"⚠️ Google returned status {response.status_code}")
+                return ""
+            
+            soup = BeautifulSoup(response.text, 'html.parser')
+            snippets = []
+            
+            search_divs = soup.find_all('div', class_='g')[:max_results]
+            
+            for div in search_divs:
+                try:
+                    snippet_elem = div.find('span')
+                    if snippet_elem:
+                        snippet = snippet_elem.get_text(strip=True)
+                        if snippet and len(snippet) > 20:
+                            snippets.append(snippet)
+                except:
+                    continue
+            
+            result = " ".join(snippets[:2])
+            logger.info(f"✅ Google search: {len(result)} chars")
+            return result
+            
+        except Exception as e:
+            logger.error(f"❌ Google search failed: {str(e)}")
+            return ""
+    
+    def search_builder_info(self, builder_name: str, city: str = "") -> str:
+        query = f"{builder_name} real estate developer"
+        if city:
+            query += f" {city}"
+        
+        logger.info(f"🔍 Quick Google search for: {query}")
+        return self.quick_google_search(query, max_results=2)
+
+# Initialize scraper globally
+web_scraper = SimpleGoogleScraper()
 
 # ============= NAMES DATABASE =============
 
@@ -113,10 +167,12 @@ INDIAN_FIRST_NAMES = [
     "Supriya","Deepthi","Sahithi","Ishita"
 ]
 
+GENERATED_DATA_FILE = "generated_content.json"
+
 # ============= CONFIGURATION =============
 
 # OpenAI Configuration
-OPENAI_API_KEY = "YOUR_OPENAI_KEY"
+OPENAI_API_KEY = "Your-API-KEY"
 
 # Company callback API
 COMPANY_CALLBACK_API = "http://192.168.0.144/superadmin/AItasks_Controller/update_Contents"
@@ -130,7 +186,6 @@ def get_random_name() -> str:
 def get_unique_names(count: int) -> List[str]:
     """Get unique random names"""
     if count > len(INDIAN_FIRST_NAMES):
-        # If we need more names than available, allow duplicates
         return [get_random_name() for _ in range(count)]
     return random.sample(INDIAN_FIRST_NAMES, count)
 
@@ -143,21 +198,84 @@ def strip_html_tags(html_text: str) -> str:
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
 
-def wrap_in_p_tags(text: str) -> str:
-    """Wrap text content in <p> tags, preserving paragraph breaks"""
+def remove_dashes_from_text(text: str) -> str:
+    """
+    Remove ALL dash symbols (–, -, —) from text including hyphens in words
+    """
     if not text:
-        return ""
+        return text
+
+    # List of all dash-like characters to remove
+    dash_characters = ['-', '–', '—']
+
+    # Remove ALL dash characters everywhere
+    for dash in dash_characters:
+        text = text.replace(dash, '')
+
+    # Remove any extra spaces created due to dash removal
+    text = re.sub(r'\s{2,}', ' ', text)
+
+    return text.strip()
+
+def clean_generated_content(content: str) -> str:
+    """
+    Clean generated content - remove dashes, markdown, and format properly
+    Use this on ALL content before returning to user
+    """
+    if not content:
+        return content
     
-    paragraphs = text.split('\n\n')
-    wrapped = []
+    # Remove markdown code blocks
+    content = content.strip()
+    if content.startswith("```html"):
+        content = content[7:]
+    if content.startswith("```"):
+        content = content[3:]
+    if content.endswith("```"):
+        content = content[:-3]
+    content = content.strip()
     
-    for para in paragraphs:
-        para = para.strip()
-        if para:
-            para = para.replace('\n', ' ')
-            wrapped.append(f"<p>{para}</p>")
+    # Remove section headers (### SECTION NAME)
+    content = re.sub(r'###\s+[A-Z\s]+\n', '', content)
     
-    return '\n'.join(wrapped)
+    # Remove dashes
+    content = remove_dashes_from_text(content)
+    
+    # Remove [Skip] lines
+    content = re.sub(r'<br>\s*<strong>[^<]+:</strong>\s*\[Skip\]', '', content)
+    content = re.sub(r'\[Skip\].*?(?=<br>|</p>|$)', '', content)
+    
+    # Clean up extra whitespace
+    content = re.sub(r'\n\s*\n\s*\n+', '\n\n', content)
+    
+    return content.strip()
+
+def save_generated_data(output_data: Dict[str, Any]) -> None:
+    """Save generated data to file, replacing previous data if property exists"""
+    try:
+        file_path = Path(GENERATED_DATA_FILE)
+        
+        existing_data = {}
+        if file_path.exists():
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    existing_data = json.load(f)
+            except Exception as e:
+                logger.warning(f"Could not load existing data: {e}")
+                existing_data = {}
+        
+        prop_id = output_data.get('propid', 'unknown')
+        output_data['generated_at'] = datetime.now().isoformat()
+        existing_data[prop_id] = output_data
+        
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(existing_data, f, indent=2, ensure_ascii=False)
+        
+        logger.info(f"✅ Saved generated data for property {prop_id} to {GENERATED_DATA_FILE}")
+        logger.info(f"📊 Total properties in file: {len(existing_data)}")
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to save generated data: {e}")
 
 def calculate_content_richness(text: str) -> int:
     """Calculate how rich/detailed the content is (word count)"""
@@ -166,9 +284,14 @@ def calculate_content_richness(text: str) -> int:
     clean_text = strip_html_tags(text)
     return len(clean_text.split())
 
-def is_content_sufficient(text: str, min_words: int = 150) -> bool:
+def count_words(text: str) -> int:
+    """Count words in text (alias for calculate_content_richness)"""
+    return calculate_content_richness(text)
+
+def is_content_sufficient(text: str, min_words: int = 250) -> bool:
     """Check if content is detailed enough"""
     word_count = calculate_content_richness(text)
+    logger.info(f"📊 Content word count: {word_count} (minimum required: {min_words})")
     return word_count >= min_words
 
 def get_fallback_seo_text_from_payload(body_data: Dict[str, Any]) -> str:
@@ -189,6 +312,28 @@ def get_fallback_seo_text_from_payload(body_data: Dict[str, Any]) -> str:
         pass
     return "Brief property overview not available. Please check property data."
 
+def clean_html_paragraphs(html_text: str) -> str:
+    """Clean HTML text and ensure proper paragraph formatting"""
+    if not html_text:
+        return ""
+    
+    # Remove dashes
+    html_text = remove_dashes_from_text(html_text)
+    
+    # Parse HTML
+    soup = BeautifulSoup(html_text, 'html.parser')
+    
+    # Get all text content
+    text = soup.get_text(separator='\n\n', strip=True)
+    
+    # Split into paragraphs and wrap in <p> tags
+    paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
+    
+    # Create clean HTML
+    clean_html = '\n'.join([f'<p>{p}</p>' for p in paragraphs])
+    
+    return clean_html
+
 # ============= INPUT MODELS =============
 
 class PropInfo(BaseModel):
@@ -207,6 +352,7 @@ class PropInfo(BaseModel):
     max_price: Optional[str] = None
 
 class BasicDetails(BaseModel):
+    property_description: Optional[str] = None
     dimension: Optional[str] = None
     total_apartments: Optional[str] = None
     area_min: Optional[str] = None
@@ -229,11 +375,12 @@ class DeveloperInfo(BaseModel):
     BuilderID: Optional[str] = None
     property_count: Optional[str] = None
     founded_year: Optional[str] = None
-    builder_description: Optional[str] = Field(None, alias='builder_listing_desc')
-    builder_data_discription: Optional[str] = Field(None, alias='builder_details_desc')
+    builder_listing_desc: Optional[str] = None
+    builder_details_desc: Optional[str] = None
     
     class Config:
-        populate_by_name = True  # Allows both the field name and alias to work
+        populate_by_name = True
+
 class IncomingPropertyData(BaseModel):
     status: Optional[str] = None
     result: Optional[str] = None
@@ -284,10 +431,13 @@ def generate_with_openai(prompt: str, max_tokens: int = 16000, temperature: floa
     
     raise RuntimeError("OpenAI generation failed after all retries")
 
-# ============= DATA TRANSFORMER =============
+# main.py - Part 2 (Lines 601-1200)
+# Data Transformer with Smart Content Validation
+
+# ============= DATA TRANSFORMER WITH CONTENT VALIDATION =============
 
 class DataTransformer:
-    """Converts company format to internal format with content richness analysis"""
+    """Converts company format to internal format with smart content validation"""
     
     @staticmethod
     def transform(incoming: IncomingPropertyData) -> Dict[str, Any]:
@@ -316,30 +466,96 @@ class DataTransformer:
         if basic.area_min and basic.area_max:
             area_range = f"{basic.area_min} - {basic.area_max} sq.ft"
         
+        # ============= SMART CONTENT VALIDATION =============
+        
+        # Check LocalityDiscription (250+ words)
         locality_desc = None
         locality_needs_generation = True
         
-        for field in [prop.Property_LocalityDiscription, prop.LocalityDiscription]:
-            if field:
-                clean_text = strip_html_tags(field)
-                if is_content_sufficient(clean_text, min_words=150):
-                    locality_desc = clean_text
-                    locality_needs_generation = False
-                    logger.info(f"✅ Sufficient locality description found ({calculate_content_richness(field)} words)")
-                    break
+        if prop.LocalityDiscription:
+            word_count = count_words(prop.LocalityDiscription)
+            logger.info(f"📊 LocalityDiscription: {word_count} words")
+            
+            if is_content_sufficient(prop.LocalityDiscription, min_words=250):
+                locality_desc = clean_html_paragraphs(prop.LocalityDiscription)
+                locality_needs_generation = False
+                logger.info(f"✅ Using existing LocalityDiscription ({word_count} words) - NO generation needed")
+            else:
+                logger.info(f"⚠️ LocalityDiscription insufficient ({word_count} words < 250) - WILL generate")
+        else:
+            logger.info("⚠️ LocalityDiscription not provided - WILL generate")
         
-        developer_desc = None
-        developer_needs_generation = True
+        # Check Property_LocalityDiscription (250+ words)
+        prop_locality_desc = None
+        prop_locality_needs_generation = True
+        
+        if prop.Property_LocalityDiscription:
+            word_count = count_words(prop.Property_LocalityDiscription)
+            logger.info(f"📊 Property_LocalityDiscription: {word_count} words")
+            
+            if is_content_sufficient(prop.Property_LocalityDiscription, min_words=250):
+                prop_locality_desc = clean_html_paragraphs(prop.Property_LocalityDiscription)
+                prop_locality_needs_generation = False
+                logger.info(f"✅ Using existing Property_LocalityDiscription ({word_count} words) - NO generation needed")
+            else:
+                logger.info(f"⚠️ Property_LocalityDiscription insufficient ({word_count} words < 250) - WILL generate")
+        else:
+            logger.info("⚠️ Property_LocalityDiscription not provided - WILL generate")
+        
+        # Check property_description (250+ words)
+        property_desc = None
+        property_needs_generation = True
+        
+        if basic.property_description:
+            word_count = count_words(basic.property_description)
+            logger.info(f"📊 property_description: {word_count} words")
+            
+            if is_content_sufficient(basic.property_description, min_words=250):
+                property_desc = clean_html_paragraphs(basic.property_description)
+                property_needs_generation = False
+                logger.info(f"✅ Using existing property_description ({word_count} words) - NO generation needed")
+            else:
+                logger.info(f"⚠️ property_description insufficient ({word_count} words < 250) - WILL generate")
+        else:
+            logger.info("⚠️ property_description not provided - WILL generate")
+        
+        # Check developer descriptions (250+ words each)
+        developer_details_desc = None
+        developer_details_needs_generation = True
+        
+        developer_listing_desc = None
+        developer_listing_needs_generation = True
         
         if dev:
-            for field in [dev.builder_data_discription, dev.builder_description]:
-                if field:
-                    clean_text = strip_html_tags(field)
-                    if is_content_sufficient(clean_text, min_words=100):
-                        developer_desc = clean_text
-                        developer_needs_generation = False
-                        logger.info(f"✅ Sufficient developer description found ({calculate_content_richness(field)} words)")
-                        break
+            # Check builder_details_desc
+            if dev.builder_details_desc:
+                word_count = count_words(dev.builder_details_desc)
+                logger.info(f"📊 builder_details_desc: {word_count} words")
+                
+                if is_content_sufficient(dev.builder_details_desc, min_words=250):
+                    developer_details_desc = clean_html_paragraphs(dev.builder_details_desc)
+                    developer_details_needs_generation = False
+                    logger.info(f"✅ Using existing builder_details_desc ({word_count} words) - NO generation needed")
+                else:
+                    logger.info(f"⚠️ builder_details_desc insufficient ({word_count} words < 250) - WILL generate")
+            else:
+                logger.info("⚠️ builder_details_desc not provided - WILL generate")
+            
+            # Check builder_listing_desc
+            if dev.builder_listing_desc:
+                word_count = count_words(dev.builder_listing_desc)
+                logger.info(f"📊 builder_listing_desc: {word_count} words")
+                
+                if is_content_sufficient(dev.builder_listing_desc, min_words=250):
+                    developer_listing_desc = clean_html_paragraphs(dev.builder_listing_desc)
+                    developer_listing_needs_generation = False
+                    logger.info(f"✅ Using existing builder_listing_desc ({word_count} words) - NO generation needed")
+                else:
+                    logger.info(f"⚠️ builder_listing_desc insufficient ({word_count} words < 250) - WILL generate")
+            else:
+                logger.info("⚠️ builder_listing_desc not provided - WILL generate")
+        else:
+            logger.info("⚠️ Developer info not provided - WILL generate")
         
         transformed = {
             "propertyID": prop.propertyID,
@@ -359,10 +575,23 @@ class DataTransformer:
             "highlights": highlight_points,
             "features": [],
             "location_data": [],
+            
+            # Existing content (if sufficient)
             "locality_description": locality_desc,
             "locality_needs_generation": locality_needs_generation,
-            "developer_description": developer_desc,
-            "developer_needs_generation": developer_needs_generation,
+            
+            "prop_locality_description": prop_locality_desc,
+            "prop_locality_needs_generation": prop_locality_needs_generation,
+            
+            "property_description": property_desc,
+            "property_needs_generation": property_needs_generation,
+            
+            "developer_details_description": developer_details_desc,
+            "developer_details_needs_generation": developer_details_needs_generation,
+            
+            "developer_listing_description": developer_listing_desc,
+            "developer_listing_needs_generation": developer_listing_needs_generation,
+            
             "developer_founded": dev.founded_year if dev else None,
             "developer_project_count": dev.property_count if dev else None
         }
@@ -398,7 +627,7 @@ INSTRUCTIONS:
    - Location (connectivity, neighborhood, nearby facilities)
    - Configuration (BHK availability, spaciousness)
    - Status (specific amenity questions, staff, charges)
-   - Possession (timeline, delays,)
+   - Possession (timeline, delays)
    - Price (starting price, payment plans, home loans)
    - Other (security features, neighborhood safety)
    - Home Loans (appreciation potential, rental demand, contact homes247 for loan)
@@ -412,6 +641,7 @@ INSTRUCTIONS:
 4. Base answers on the actual property data provided
 5. DO NOT make up information not present in the data
 6. If specific data is not available, give general but realistic answers
+7. DO NOT use dash symbols (–, -, —) anywhere in questions or answers
 
 OUTPUT FORMAT (JSON only, no markdown):
 [
@@ -465,14 +695,16 @@ def generate_faqs(data: Dict[str, Any], seo_content: str) -> List[Dict[str, Any]
             if not question or not answers_text:
                 continue
             
-            # Get unique names for this FAQ
-            names_needed = len(answers_text) + 1  # +1 for question asker
+            # CRITICAL: Remove dashes from question and answers
+            question = remove_dashes_from_text(question)
+            answers_text = [remove_dashes_from_text(ans) for ans in answers_text]
+            
+            names_needed = len(answers_text) + 1
             unique_names = get_unique_names(names_needed)
             
             question_asker = unique_names[0]
             answer_givers = unique_names[1:]
             
-            # Format answers
             formatted_answers = []
             for idx, answer_text in enumerate(answers_text):
                 formatted_answers.append({
@@ -496,207 +728,6 @@ def generate_faqs(data: Dict[str, Any], seo_content: str) -> List[Dict[str, Any]
         logger.error(f"❌ FAQ generation failed: {str(e)}")
         return []
 
-# ============= ENHANCED PROMPT BUILDER =============
-
-def create_optimized_prompt(data: Dict[str, Any]) -> str:
-    """Create SEO-optimized prompt based on content availability"""
-    
-    locality_instruction = ""
-    if data['locality_needs_generation']:
-        locality_instruction = """
- LOCATION 
-Generate 180-220 words about the location:
-- Focus on connectivity and nearby areas
-- Mention growth potential and livability
-- Highlight infrastructure and accessibility
-- 2-3 paragraphs"""
-    else:
-        locality_instruction = f"""
- LOCATION 
-The following locality information is provided. RESTRUCTURE it for SEO optimization (180-220 words):
-- Make it engaging and informative
-- Remove redundant information and HTML tags
-- Focus on key benefits, connectivity, and growth
-- Highlight nearby IT hubs, schools, hospitals if mentioned
-- Keep it 2-3 well-structured paragraphs
-
-PROVIDED LOCALITY INFO:
-{data['locality_description'][:1500]}"""
-
-    developer_instruction = ""
-    if data['developer_needs_generation']:
-        developer_instruction = """
- ABOUT THE DEVELOPER
-Generate 180-220 words about the developer:
-- Company background and founding year
-- Experience and expertise in real estate
-- Key achievements and completed projects
-- Quality standards and customer satisfaction
-- Unique selling points
-- 2-3 comprehensive paragraphs"""
-    else:
-        developer_instruction = f"""
- ABOUT THE DEVELOPER 
-The following developer information is provided. RESTRUCTURE it for SEO optimization (180-220 words):
-- Create a comprehensive developer profile
-- Remove HTML tags and redundant information
-- Focus on: company history, experience, achievements, quality standards
-- Include specific numbers and facts (project count, area developed, experience years)
-- Highlight unique strengths and customer satisfaction
-- Make it professional and engaging
-- 2-3 well-structured paragraphs
-
-PROVIDED DEVELOPER INFO:
-{data['developer_description'][:1500]}
-
-Additional Info:
-- Founded: {data.get('developer_founded', 'Not specified')}
-- Total Projects: {data.get('developer_project_count', 'Not specified')}"""
-
-    highlights_instruction = ""
-    if data['highlights']:
-        highlights_instruction = f"""
- HIGHLIGHTS 
-The following highlights are provided. Present them in engaging format (120-140 words):
-{chr(10).join(['- ' + h for h in data['highlights'][:10]])}
-
-Format as 8-10 concise bullet points with benefit-focused descriptions."""
-    else:
-        highlights_instruction = """
- HIGHLIGHTS 
-Based on amenities and available data, create 8-10 compelling highlights (120-140 words):
-- Focus on unique selling points
-- Format: "Feature name for benefit"
-- Keep concise and impactful"""
-
-    prompt = f"""You are an expert SEO content writer for Homes247.in real estate portal.
-
-Generate SEO-optimized property page content for: {data['project_name']}
-
-AVAILABLE DATA:
-Project: {data['project_name']}
-Builder: {data['builder'] or 'Not specified'}
-Location: {data['location'] or 'Not specified'}
-Configurations: {', '.join(data['configurations']) if data['configurations'] else 'Not specified'}
-Area: {data['area_range'] or 'Not specified'}
-Price: {data['price_range'] or 'Not specified'}
-Possession: {data['possession_date'] or 'Not specified'}
-Status: {data['status'] or 'Not specified'}
-RERA: {data['rera_id'] or 'Not specified'}
-Units: {data['total_units'] or 'Not specified'}
-Amenities: {', '.join(data['amenities'][:20]) if data['amenities'] else 'Not specified'}
-
-CRITICAL RULES:
-1. For sections with PROVIDED content - RESTRUCTURE for SEO, expand if needed, but keep it informative
-2. For sections marked "Generate" - Create engaging original content
-3. ONLY use data provided above - NO hallucinations
-4. If data says "Not specified", SKIP that information entirely
-5. Never write "coming soon", "will be updated", "not mentioned"
-6. Write naturally - if information is missing, don't include that point
-7. Each section must be comprehensive and well-detailed
-8. Remove ALL HTML tags, keep only clean text
-
-OUTPUT FORMAT:
-
- OVERVIEW 
-Project Name: {data['project_name']}
-Builder: {data['builder'] or '[Skip this line]'}
-Location: {data['location'] or '[Skip this line]'}
-Configurations: {', '.join(data['configurations']) if data['configurations'] else '[Skip this line]'}
-Area Range: {data['area_range'] or '[Skip this line]'}
-Price Range: {data['price_range'] or '[Skip this line]'}
-Possession: {data['possession_date'] or data['status'] or '[Skip this line]'}
-RERA ID: {data['rera_id'] or '[Skip this line]'}
-
-(Remove any lines that say [Skip this line])
-
- ABOUT 
-Write 200-250 words describing the PROJECT (not the developer):
-- Start with: "{data['project_name']} by {data['builder'] or 'the developer'} is..."
-- Focus on: what makes this project special, location advantages, lifestyle it offers
-- Mention configurations and who it's ideal for
-- Discuss the living experience and community feel
-- Highlight key features like possession status, number of units
-- Make it engaging and benefit-focused
-- DO NOT include developer/builder information here - that goes in the DEVELOPER section
-- 3-4 paragraphs about the PROJECT itself
-
-{highlights_instruction}
-
- AMENITIES
-{'Write 180-220 words about the following amenities:' if data['amenities'] else 'Write 180-220 words about typical modern amenities:'}
-{', '.join(data['amenities'][:20]) if data['amenities'] else 'Not specified - use general modern amenities'}
-- Group by category: fitness & sports, leisure & entertainment, convenience & services, security & safety
-- Describe each category with 2-3 sentences explaining the benefits
-- 3-4 paragraphs with rich descriptions
-- Make it lifestyle-focused, not just a list
-
-{locality_instruction}
-
-{developer_instruction}
-
- SPECIFICATIONS 
-Write 80-100 words about unit specifications:
-- List area ranges for each configuration if available
-- Mention total number of units and towers if specified
-- Include possession date and RERA details
-- Keep it organized and easy to read
-- Format as short, clear sentences
-
- WHO SHOULD BUY THIS 
-(Required - 200-250 words total)
-
-**Ideal for Families:**
-Write 3-4 sentences explaining why families should consider this property.
-Focus on: space, amenities for children, safety, community, schools nearby.
-
-**Perfect for Working Professionals:**
-Write 3-4 sentences explaining the benefits for working professionals.
-Focus on: location, connectivity to IT hubs, modern amenities, lifestyle.
-
-**Smart Investment Opportunity:**
-Write 3-4 sentences about investment potential.
-Focus on: location growth, appreciation potential, rental demand, builder reputation.
-
-IMPORTANT REMINDERS:
-- ABOUT section = About the PROJECT only (200-250 words)
-- ABOUT THE DEVELOPER section = Separate detailed section about builder (180-220 words)
-- Remove ALL HTML tags from restructured content
-- Make each section comprehensive and detailed
-- No generic or vague statements
-
-Generate the complete content now."""
-
-    return prompt
-
-# ============= CONTENT GENERATOR =============
-
-async def generate_seo_content(data: Dict[str, Any]) -> str:
-    """Generate SEO content using OpenAI GPT-4o-mini with intelligent restructuring"""
-    try:
-        prompt = create_optimized_prompt(data)
-        
-        logger.info(f"🔄 Content generation mode (OpenAI GPT-4o-mini):")
-        logger.info(f"   - Locality: {'RESTRUCTURE' if not data['locality_needs_generation'] else 'GENERATE'}")
-        logger.info(f"   - Developer: {'RESTRUCTURE' if not data['developer_needs_generation'] else 'GENERATE'}")
-        
-        generated_text = generate_with_openai(prompt, max_tokens=16000, temperature=0.7)
-        
-        generated_text = re.sub(r'\|\s*\|', '', generated_text)
-        generated_text = re.sub(r'\|\s*---\s*\|', '', generated_text)
-        generated_text = re.sub(r'\[Skip this line\].*?\n', '', generated_text)
-        
-        phrases_to_remove = [
-            "coming soon", "will be updated soon", "to be updated",
-            "details will be shared", "information not available"
-        ]
-        for phrase in phrases_to_remove:
-            generated_text = re.sub(phrase, '', generated_text, flags=re.IGNORECASE)
-        
-        return generated_text
-        
-    except Exception as e:
-        raise RuntimeError(f"Content generation failed: {str(e)}")
 
 # ============= REVIEW GENERATOR =============
 
@@ -707,63 +738,592 @@ def generate_reviews(seo_content: str, count: int = 10) -> List[Dict[str, Any]]:
         return []
     
     try:
-        json_str, reviews = generate_reviews_from_text(seo_content, count)
+        # Remove dashes before generating reviews
+        clean_content = remove_dashes_from_text(seo_content)
+        json_str, reviews = generate_reviews_from_text(clean_content, count)
+        
+        # Remove dashes from generated reviews
+        for review in reviews:
+            if 'review' in review:
+                review['review'] = remove_dashes_from_text(review['review'])
+        
         return reviews
     except Exception as e:
         logger.error(f"Review generation failed: {str(e)}")
         return []
+    
+# main.py - Part 3 (Lines 1201-1800)
+# Smart Prompt Builder with Conditional Generation
 
-# ============= FORMAT OUTPUT =============
+# ============= SMART PROMPT BUILDER =============
 
-# ============= FORMAT OUTPUT =============
+# Replace the create_optimized_prompt function in your main.py with this version
+
+def create_optimized_prompt(data: Dict[str, Any]) -> str:
+    """Create SEO-optimized prompt with strategic keyword repetition"""
+    
+    # Extract location components
+    location = data.get('location', 'Area')
+    location_parts = location.split(',') if location else ['Area']
+    locality = location_parts[0].strip() if location_parts else 'locality'
+    city = location_parts[-1].strip() if len(location_parts) > 1 else ''
+    
+    # Determine property type
+    configurations = data.get('configurations', [])
+    if configurations:
+        bhk = configurations[0]
+        property_type = f"{bhk} apartments" if bhk else "residential apartments"
+    else:
+        property_type = "residential apartments"
+    
+    # Create primary keywords
+    primary_keyword = f"{property_type} in {locality}"
+    secondary_keyword = f"{property_type} near {locality}"
+    location_keyword = f"{locality}, {city}" if city else locality
+    
+    logger.info(f"🎯 Primary keyword: {primary_keyword}")
+    logger.info(f"🎯 Secondary keyword: {secondary_keyword}")
+    
+    # Get web context for developer if needed
+    web_context = ""
+    if data.get('developer_details_needs_generation') or data.get('developer_listing_needs_generation'):
+        try:
+            web_context = web_scraper.search_builder_info(
+                data.get('builder', 'Developer'),
+                city
+            )
+            time.sleep(0.5)
+        except:
+            pass
+    
+    sections_to_generate = []
+    prompt = f"""You are an expert SEO content writer for Homes247.in real estate portal.
+
+**CRITICAL SEO INSTRUCTIONS:**
+1. Generate 5 COMPLETELY DIFFERENT sections
+2. Each section starts with: === SECTION_NAME ===
+3. Use PRIMARY KEYWORD "{primary_keyword}" 3-4 times naturally across all sections
+4. Use SECONDARY KEYWORD "{secondary_keyword}" 2-4 times naturally
+5. Use LOCATION "{location_keyword}" frequently (4-6 times total)
+6. NO dash symbols (–, -, —)
+7. Use only <p>, <strong>, <br> tags
+8. Write in clean HTML paragraphs
+9. Keywords should appear naturally, not forced
+
+**PROPERTY DATA:**
+Project: {data['project_name']}
+Builder: {data.get('builder', 'Developer')}
+Location: {location}
+Property Type: {property_type}
+Configurations: {', '.join(configurations) if configurations else 'Various'}
+Area: {data.get('area_range', 'Varies')}
+Price: {data.get('price_range', 'Contact for pricing')}
+
+"""
+    
+    # Section 1: LocalityDiscription (ONLY LOCATION - NO PROPERTY)
+    if data['locality_needs_generation']:
+        prompt += f"""
+=== LOCATION DESCRIPTION ===
+
+Write 250-300 words about {locality} area in {city} ONLY.
+DO NOT mention "{data['project_name']}" property name.
+DO NOT mention any builder name.
+
+**KEYWORD USAGE (3-4 times in this section):**
+- Use "{secondary_keyword}" 2 times
+- Use "{location_keyword}" 2-3 times
+
+**Structure:**
+<p>Paragraph 1: {locality} is a prominent locality in {city} known for excellent connectivity. Mention "{secondary_keyword}" naturally. Discuss roads, highways, metro stations, and public transport in {locality}...</p>
+
+<p>Paragraph 2: The infrastructure in {locality} makes it ideal for residential living. Mention nearby amenities like schools, hospitals, shopping malls, and IT hubs that make "{secondary_keyword}" highly desirable...</p>
+
+<p>Paragraph 3: Growth potential of {locality} area with upcoming infrastructure projects, metro expansions, and real estate development in {city}...</p>
+
+**REMEMBER:** Use "{secondary_keyword}" naturally 2 times in this section.
+
+"""
+        sections_to_generate.append("LOCATION DESCRIPTION")
+    
+    # Section 2: Property_LocalityDiscription (PROPERTY + LOCATION)
+    if data['prop_locality_needs_generation']:
+        prompt += f"""
+=== PROPERTY LOCALITY DESCRIPTION ===
+
+Write 250-300 words about {data['project_name']} in {locality}.
+**CRITICAL:** Use "{primary_keyword}" 2-3 times naturally in this section.
+
+**KEYWORD USAGE (4-5 times in this section):**
+- Use "{primary_keyword}" 2-3 times
+- Use "{location_keyword}" 3-4 times
+- Mention property name 2-3 times
+
+**Structure:**
+<p>Paragraph 1: {data['project_name']} in {locality} offers {property_type} that redefine modern living in {city}. These "{primary_keyword}" provide excellent connectivity advantages with proximity to major highways, metro stations, and business districts...</p>
+
+<p>Paragraph 2: Residents of {data['project_name']} benefit from {locality}'s strategic location. The "{primary_keyword}" are surrounded by quality schools, healthcare facilities, and shopping centers. Commuting from {location_keyword} to key areas is seamless...</p>
+
+<p>Paragraph 3: Investing in {data['project_name']} means securing one of the finest "{primary_keyword}" available. The project combines modern amenities with the location benefits of {locality}, making it ideal for families and professionals in {city}...</p>
+
+**REMEMBER:** Use "{primary_keyword}" naturally 2-3 times in this section.
+
+"""
+        sections_to_generate.append("PROPERTY LOCALITY DESCRIPTION")
+    
+    # Section 3: Property Description (FULL PROPERTY DETAILS)
+    if data['property_needs_generation']:
+        highlights_text = ""
+        if data['highlights']:
+            highlights_text = '<br>'.join([h for h in data['highlights'][:10]])
+        else:
+            highlights_text = "Create 8-10 bullet points about property features"
+        
+        prompt += f"""
+=== PROPERTY DESCRIPTION ===
+
+**KEYWORD USAGE (2-3 times in ABOUT section):**
+- Use "{primary_keyword}" 1-2 times in ABOUT section
+- Use property name 2-3 times throughout
+- Use "{location_keyword}" 2-3 times
+
+<p><strong>OVERVIEW</strong><br>
+<strong>Project Name:</strong> {data['project_name']}<br>
+<strong>Builder:</strong> {data['builder'] or 'Developer name'}<br>
+<strong>Location:</strong> {location}<br>
+<strong>Configurations:</strong> {', '.join(configurations) if configurations else 'Various'}<br>
+<strong>Area Range:</strong> {data['area_range'] or 'Varies'}<br>
+<strong>Price Range:</strong> {data['price_range'] or 'Contact for pricing'}<br>
+<strong>Possession:</strong> {data['possession_date'] or data['status'] or 'Contact for details'}</p>
+
+<p><strong>ABOUT</strong><br>
+{data['project_name']} by {data['builder'] or 'the developer'} is a premium residential project offering {property_type}. Write 250-300 words naturally incorporating "{primary_keyword}" 1-2 times. These "{primary_keyword}" are designed for modern families seeking luxury and comfort in {location_keyword}. Describe the project's unique features, spacious configurations, lifestyle benefits, and what makes these "{primary_keyword}" stand out in the market. Highlight the living experience, community atmosphere, and quality construction standards that make {data['project_name']} exceptional among "{primary_keyword}".</p>
+
+<p><strong>HIGHLIGHTS</strong><br>
+{highlights_text}</p>
+
+<p><strong>AMENITIES</strong><br>
+Write 200 words about amenities: {', '.join(data['amenities'][:20]) if data['amenities'] else 'Modern amenities'}. Group by categories (fitness, leisure, convenience, security). Describe how these amenities enhance the lifestyle experience for residents of these "{primary_keyword}".</p>
+
+<p><strong>SPECIFICATIONS</strong><br>
+Write 100 words about unit specifications: area ranges {data['area_range'] or ''}, possession {data['possession_date'] or ''}, RERA {data['rera_id'] or 'Contact for details'}, total units, and other technical details.</p>
+
+<p><strong>WHO SHOULD BUY THIS</strong></p>
+
+<p><strong>Ideal for Families:</strong><br>
+Write 3-4 sentences explaining why {data['project_name']} is perfect for families. Mention proximity to schools, safe environment, and spacious living.</p>
+
+<p><strong>Perfect for Working Professionals:</strong><br>
+Write 3-4 sentences about benefits for professionals. Mention connectivity to IT hubs, modern amenities, work-life balance.</p>
+
+<p><strong>Smart Investment Opportunity:</strong><br>
+Write 3-4 sentences about investment potential in {location_keyword}. Mention appreciation prospects, rental demand, and quality construction.</p>
+
+"""
+        sections_to_generate.append("PROPERTY DESCRIPTION")
+    
+    # Section 4: Developer Details (COMPANY BACKGROUND)
+    if data['developer_details_needs_generation']:
+        prompt += f"""
+=== DEVELOPER DETAILS DESCRIPTION ===
+
+Write 250-300 words ABOUT {data.get('builder', 'THE DEVELOPER')} COMPANY ONLY.
+This is COMPANY INFORMATION - history, experience, completed projects.
+DO NOT write about location or property.
+DO NOT write about "why choose" or buyer benefits.
+DO NOT use keywords about apartments or location here.
+
+<p>Paragraph 1: {data.get('builder', 'The developer')} is a prominent real estate developer with a vision to create exceptional living spaces. Discuss company founding year, establishment story, initial projects, and how it started in the real estate business...</p>
+
+<p>Paragraph 2: With extensive experience in construction, {data.get('builder', 'The developer')} has successfully delivered numerous residential and commercial projects. Mention years in business, types of projects completed, scale of developments, and expertise areas...</p>
+
+<p>Paragraph 3: {data.get('builder', 'The developer')} maintains high quality standards through modern construction methods, premium materials, strict safety protocols, and industry certifications. Discuss building practices and quality assurance...</p>
+
+<p>Paragraph 4: Customer satisfaction is central to {data.get('builder', 'The developer')}'s operations. The company ensures transparency, maintains strong client relationships, provides excellent service, and has built a solid market reputation...</p>
+
+Web context: {web_context[:500] if web_context else 'Leading real estate developer with proven track record'}
+
+"""
+        sections_to_generate.append("DEVELOPER DETAILS DESCRIPTION")
+    
+    # Section 5: Developer Listing (WHY CHOOSE THIS BUILDER)
+    if data['developer_listing_needs_generation']:
+        prompt += f"""
+=== DEVELOPER LISTING DESCRIPTION ===
+
+Write 250-300 words about WHY HOMEBUYERS SHOULD CHOOSE {data.get('builder', 'THIS DEVELOPER')}.
+This is BUYER BENEFITS section - not company history.
+DO NOT repeat company background from previous section.
+DO NOT write about location or specific property.
+DO NOT use apartment/location keywords here.
+
+<p>Paragraph 1: Choosing the right developer is crucial for homebuyers when investing in real estate. The developer's reputation directly impacts construction quality, timely delivery, and long-term property value. Explain why trust and reliability matter...</p>
+
+<p>Paragraph 2: {data.get('builder', 'This developer')} demonstrates unwavering commitment to quality construction through use of premium materials, adherence to safety standards, and focus on durability. Homes built by {data.get('builder', 'this developer')} are designed to last, providing long-term value to buyers...</p>
+
+<p>Paragraph 3: {data.get('builder', 'This developer')} has an excellent track record of timely project delivery, ensuring buyers can move into their homes as scheduled. This reliability provides peace of mind and demonstrates professionalism in project execution and timeline management...</p>
+
+<p>Paragraph 4: {data.get('builder', 'This developer')} prioritizes customer service excellence, offering value for money, comprehensive after-sales support, warranty programs, and maintenance assistance. This customer-first approach ensures buyer satisfaction extends well beyond the purchase...</p>
+
+"""
+        sections_to_generate.append("DEVELOPER LISTING DESCRIPTION")
+    
+    if not sections_to_generate:
+        return None
+    
+    prompt += f"""
+
+**FINAL CRITICAL RULES:**
+1. Start each section with: === SECTION_NAME ===
+2. Make each section COMPLETELY DIFFERENT in content
+3. USE PRIMARY KEYWORD "{primary_keyword}" 2-3 TIMES TOTAL (naturally distributed)
+4. USE SECONDARY KEYWORD "{secondary_keyword}" 2-3 TIMES TOTAL
+5. USE LOCATION "{location_keyword}" 6-7 TIMES TOTAL
+6. Keywords must flow naturally in sentences
+7. Location section = ONLY about locality (no property, no builder)
+8. Property Locality = PROPERTY + LOCATION combination (use primary keyword 2-3 times)
+9. Property Description = FULL property details (use primary keyword 1-2 times)
+10. Developer sections = NO property/location keywords
+11. NO ```html blocks
+12. NO dash symbols anywhere
+13. Clean HTML paragraphs only
+
+**KEYWORD DISTRIBUTION SUMMARY:**
+- Location Description: "{secondary_keyword}" × 2, "{location_keyword}" × 2-4
+- Property Locality Description: "{primary_keyword}" × 2-3, "{location_keyword}" × 2-3
+- Property Description: "{primary_keyword}" × 1-2 in ABOUT section
+- Developer sections: NO apartment/location keywords
+
+Generate ALL sections NOW with natural keyword usage:"""
+    
+    logger.info(f"📝 Will generate {len(sections_to_generate)} sections: {', '.join(sections_to_generate)}")
+    logger.info(f"🎯 Target keyword occurrences: '{primary_keyword}' (3-4×), '{secondary_keyword}' (2-3×)")
+    
+    return prompt
+
+# Update the generate_seo_content function to include keyword validation
+
+# ============= CONTENT GENERATOR =============
+
+async def generate_seo_content(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Generate SEO content - SIMPLIFIED VERSION WITHOUT KEYWORD VALIDATION"""
+    try:
+        prompt = create_optimized_prompt(data)
+        
+        # If prompt is None, all content is sufficient
+        if prompt is None:
+            logger.info("✨ All content sufficient - returning existing content")
+            return {
+                "locality_description": data.get('locality_description'),
+                "prop_locality_description": data.get('prop_locality_description'),
+                "property_description": data.get('property_description'),
+                "developer_details_description": data.get('developer_details_description'),
+                "developer_listing_description": data.get('developer_listing_description'),
+                "generation_skipped": True
+            }
+        
+        logger.info(f"🔄 Generating content...")
+        
+        # Generate with higher temperature for more variety
+        generated_text = generate_with_openai(prompt, max_tokens=16000, temperature=0.8)
+        
+        logger.info(f"📄 Generated text length: {len(generated_text)} chars")
+        
+        # Clean the generated text
+        generated_text = clean_generated_content(generated_text)
+        
+        # Extract each section
+        result = {}
+        
+        if data['locality_needs_generation']:
+            content = extract_section(generated_text, 'LOCATION DESCRIPTION')
+            result['locality_description'] = clean_generated_content(content) if content else None
+        else:
+            result['locality_description'] = data.get('locality_description')
+        
+        if data['prop_locality_needs_generation']:
+            content = extract_section(generated_text, 'PROPERTY LOCALITY DESCRIPTION')
+            result['prop_locality_description'] = clean_generated_content(content) if content else None
+        else:
+            result['prop_locality_description'] = data.get('prop_locality_description')
+        
+        if data['property_needs_generation']:
+            content = extract_section(generated_text, 'PROPERTY DESCRIPTION')
+            result['property_description'] = clean_generated_content(content) if content else None
+        else:
+            result['property_description'] = data.get('property_description')
+        
+        if data['developer_details_needs_generation']:
+            content = extract_section(generated_text, 'DEVELOPER DETAILS DESCRIPTION')
+            result['developer_details_description'] = clean_generated_content(content) if content else None
+        else:
+            result['developer_details_description'] = data.get('developer_details_description')
+        
+        if data['developer_listing_needs_generation']:
+            content = extract_section(generated_text, 'DEVELOPER LISTING DESCRIPTION')
+            result['developer_listing_description'] = clean_generated_content(content) if content else None
+        else:
+            result['developer_listing_description'] = data.get('developer_listing_description')
+        
+        result['generation_skipped'] = False
+        
+        return result
+        
+    except Exception as e:
+        raise RuntimeError(f"Content generation failed: {str(e)}")
+    
+
+def extract_section(text: str, section_name: str) -> Optional[str]:
+    """Extract sections with multiple fallback strategies - ULTRA ROBUST VERSION"""
+    try:
+        if not text or not text.strip():
+            logger.error(f"❌ Empty text provided for extraction")
+            return None
+        
+        text = text.strip()
+        logger.info(f"🔍 Attempting to extract: {section_name}")
+        logger.info(f"📄 Full text length: {len(text)} chars, {len(text.split())} words")
+        
+        # Strategy 1: Try === SECTION_NAME === markers
+        section_patterns = {
+            'LOCATION DESCRIPTION': [
+                r'===\s*LOCATION DESCRIPTION\s*===',
+                r'###\s*LOCATION DESCRIPTION',
+                r'LOCATION DESCRIPTION'
+            ],
+            'PROPERTY LOCALITY DESCRIPTION': [
+                r'===\s*PROPERTY LOCALITY DESCRIPTION\s*===',
+                r'###\s*PROPERTY LOCALITY DESCRIPTION',
+                r'PROPERTY LOCALITY DESCRIPTION'
+            ],
+            'PROPERTY DESCRIPTION': [
+                r'===\s*PROPERTY DESCRIPTION\s*===',
+                r'###\s*PROPERTY DESCRIPTION',
+                r'PROPERTY DESCRIPTION',
+                r'<p><strong>OVERVIEW'
+            ],
+            'DEVELOPER DETAILS DESCRIPTION': [
+                r'===\s*DEVELOPER DETAILS DESCRIPTION\s*===',
+                r'###\s*DEVELOPER DETAILS DESCRIPTION',
+                r'DEVELOPER DETAILS DESCRIPTION'
+            ],
+            'DEVELOPER LISTING DESCRIPTION': [
+                r'===\s*DEVELOPER LISTING DESCRIPTION\s*===',
+                r'###\s*DEVELOPER LISTING DESCRIPTION',
+                r'DEVELOPER LISTING DESCRIPTION'
+            ]
+        }
+        
+        patterns = section_patterns.get(section_name, [section_name])
+        
+        # Try each pattern
+        for pattern in patterns:
+            try:
+                # Split by this pattern
+                parts = re.split(pattern, text, flags=re.IGNORECASE)
+                
+                if len(parts) > 1:
+                    logger.info(f"✅ Found section marker: {pattern}")
+                    content = parts[1]
+                    
+                    # Find the end of this section (next === or ### or end)
+                    next_section = re.search(r'(===|###)\s+', content)
+                    if next_section:
+                        content = content[:next_section.start()]
+                    
+                    # Extract all paragraphs
+                    paragraphs = re.findall(r'<p>.*?</p>', content, re.DOTALL)
+                    
+                    if paragraphs:
+                        result = '\n'.join(paragraphs).strip()
+                        word_count = count_words(result)
+                        
+                        if word_count > 50:
+                            logger.info(f"✅ Extracted {section_name}: {word_count} words via pattern '{pattern}'")
+                            return result
+                        else:
+                            logger.warning(f"⚠️ Content too short ({word_count} words)")
+                            
+            except Exception as e:
+                logger.warning(f"⚠️ Pattern '{pattern}' failed: {e}")
+                continue
+        
+        # Strategy 2: PROPERTY DESCRIPTION - Look for OVERVIEW tag
+        if section_name == 'PROPERTY DESCRIPTION':
+            overview_match = re.search(
+                r'(<p><strong>OVERVIEW.*?)(?:===|###|\Z)',
+                text,
+                re.DOTALL | re.IGNORECASE
+            )
+            if overview_match:
+                content = overview_match.group(1).strip()
+                word_count = count_words(content)
+                if word_count > 100:
+                    logger.info(f"✅ Extracted {section_name} via OVERVIEW: {word_count} words")
+                    return content
+        
+        # Strategy 3: Split text into 5 equal chunks and assign by position
+        logger.warning(f"⚠️ No markers found. Attempting smart paragraph distribution...")
+        
+        all_paragraphs = re.findall(r'<p>.*?</p>', text, re.DOTALL)
+        total_paragraphs = len(all_paragraphs)
+        
+        logger.info(f"📊 Total paragraphs found: {total_paragraphs}")
+        
+        if total_paragraphs < 10:
+            logger.error(f"❌ Insufficient paragraphs ({total_paragraphs}) to extract sections")
+            return None
+        
+        # Intelligent chunk distribution
+        chunk_size = max(3, total_paragraphs // 5)
+        
+        section_ranges = {
+            'LOCATION DESCRIPTION': (0, chunk_size),
+            'PROPERTY LOCALITY DESCRIPTION': (chunk_size, chunk_size * 2),
+            'PROPERTY DESCRIPTION': (chunk_size * 2, chunk_size * 4),  # Larger chunk
+            'DEVELOPER DETAILS DESCRIPTION': (chunk_size * 4, chunk_size * 4 + chunk_size // 2),
+            'DEVELOPER LISTING DESCRIPTION': (chunk_size * 4 + chunk_size // 2, total_paragraphs)
+        }
+        
+        if section_name in section_ranges:
+            start, end = section_ranges[section_name]
+            selected_paragraphs = all_paragraphs[start:end]
+            
+            if selected_paragraphs:
+                result = '\n'.join(selected_paragraphs).strip()
+                word_count = count_words(result)
+                logger.info(f"✅ Extracted {section_name} via smart distribution: {word_count} words (paragraphs {start}-{end})")
+                return result
+        
+        logger.error(f"❌ All extraction strategies failed for {section_name}")
+        return None
+        
+    except Exception as e:
+        logger.error(f"❌ Fatal error extracting {section_name}: {e}")
+        return None
+
+def validate_extracted_content(
+    locality_desc: Optional[str],
+    prop_locality_desc: Optional[str],
+    property_desc: Optional[str],
+    builder_details: Optional[str],
+    builder_listing: Optional[str]
+) -> Dict[str, Any]:
+    """Validate that extracted content is actually different"""
+    
+    validation_result = {
+        "all_valid": True,
+        "issues": []
+    }
+    
+    def get_first_50_words(text: str) -> str:
+        if not text:
+            return ""
+        words = strip_html_tags(text).split()[:50]
+        return ' '.join(words).lower()
+    
+    contents = {
+        "locality_desc": get_first_50_words(locality_desc),
+        "prop_locality_desc": get_first_50_words(prop_locality_desc),
+        "property_desc": get_first_50_words(property_desc),
+        "builder_details": get_first_50_words(builder_details),
+        "builder_listing": get_first_50_words(builder_listing)
+    }
+    
+    # Check for duplicates
+    for key1, content1 in contents.items():
+        if not content1:
+            continue
+        for key2, content2 in contents.items():
+            if key1 >= key2 or not content2:
+                continue
+            
+            # Calculate similarity (simple word overlap)
+            words1 = set(content1.split())
+            words2 = set(content2.split())
+            
+            if len(words1) > 0 and len(words2) > 0:
+                overlap = len(words1.intersection(words2))
+                similarity = overlap / min(len(words1), len(words2))
+                
+                if similarity > 0.7:  # 70% similar = duplicate
+                    validation_result["all_valid"] = False
+                    validation_result["issues"].append(
+                        f"⚠️ {key1} and {key2} are {similarity*100:.0f}% similar (likely duplicates)"
+                    )
+                    logger.error(f"❌ DUPLICATE CONTENT: {key1} ≈ {key2} ({similarity*100:.0f}% similar)")
+    
+    if validation_result["all_valid"]:
+        logger.info("✅ Content validation passed - all sections are unique")
+    else:
+        logger.error(f"❌ Content validation FAILED: {len(validation_result['issues'])} issues")
+        for issue in validation_result["issues"]:
+            logger.error(issue)
+    
+    return validation_result
+
+    # ============= FORMAT OUTPUT =============
 
 def format_output(
     transformed_data: Dict[str, Any],
-    seo_content: str,
+    generated_content: Dict[str, Any],
     reviews: List[Dict[str, Any]],
     faqs: List[Dict[str, Any]],
-    enhanced_content: Optional[Dict[str, Any]],
     error_note: Optional[str] = None
 ) -> Dict[str, Any]:
     """Format output in the exact required format"""
     
-    seo_content_html = wrap_in_p_tags(seo_content)
+    # Get the full property description (combines all sections)
+    prop_desc = generated_content.get('property_description', '')
     
-    locality_desc = None
-    prop_locality_desc = None
-    builder_desc_details = None
-    builder_desc_listing = None
+    # Get locality descriptions
+    locality_desc = generated_content.get('locality_description')
+    prop_locality_desc = generated_content.get('prop_locality_description')
     
-    if enhanced_content:
-        # Wrap enhanced content fields in <p> tags
-        locality_desc_raw = enhanced_content.get('LocalityDiscription')
-        prop_locality_desc_raw = enhanced_content.get('Property_LocalityDiscription')
-        builder_desc_details_raw = enhanced_content.get('builder_data_discription')
-        builder_desc_listing_raw = enhanced_content.get('builder_description')
-        
-        # Apply wrap_in_p_tags to each field if it exists
-        locality_desc = wrap_in_p_tags(locality_desc_raw) if locality_desc_raw else None
-        prop_locality_desc = wrap_in_p_tags(prop_locality_desc_raw) if prop_locality_desc_raw else None
-        builder_desc_details = wrap_in_p_tags(builder_desc_details_raw) if builder_desc_details_raw else None
-        builder_desc_listing = wrap_in_p_tags(builder_desc_listing_raw) if builder_desc_listing_raw else None
+    # Get developer descriptions
+    builder_details_desc = generated_content.get('developer_details_description')
+    builder_listing_desc = generated_content.get('developer_listing_description')
+    
+    # Log what we're using
+    if generated_content.get('generation_skipped'):
+        logger.info("✨ Using all existing content (no generation performed)")
+    else:
+        logger.info("📊 Content sources:")
+        logger.info(f"   - locality_desc: {'GENERATED' if transformed_data['locality_needs_generation'] else 'EXISTING'}")
+        logger.info(f"   - prop_locality_desc: {'GENERATED' if transformed_data['prop_locality_needs_generation'] else 'EXISTING'}")
+        logger.info(f"   - prop_desc: {'GENERATED' if transformed_data['property_needs_generation'] else 'EXISTING'}")
+        logger.info(f"   - builder_details: {'GENERATED' if transformed_data['developer_details_needs_generation'] else 'EXISTING'}")
+        logger.info(f"   - builder_listing: {'GENERATED' if transformed_data['developer_listing_needs_generation'] else 'EXISTING'}")
     
     output = {
         "propid": transformed_data.get('propertyID'),
         "prop_name": transformed_data.get('project_name'),
-        "prop_desc": seo_content_html,
+        "prop_desc": prop_desc,
         "localityid": transformed_data.get('localityID'),
         "locality_desc": locality_desc,
         "prop_locality_desc": prop_locality_desc,
         "builderid": transformed_data.get('BuilderID'),
-        "builder_desc_details": builder_desc_details,
-        "builder_desc_listing": builder_desc_listing,
+        "builder_desc_details": builder_details_desc,
+        "builder_desc_listing": builder_listing_desc,
         "reviews": reviews,
         "FAQ": faqs,
         "error_note": error_note
     }
     
+    # Log word counts
+    logger.info("📊 Final content word counts:")
+    if locality_desc:
+        logger.info(f"   - locality_desc: {count_words(locality_desc)} words")
+    if prop_locality_desc:
+        logger.info(f"   - prop_locality_desc: {count_words(prop_locality_desc)} words")
+    if prop_desc:
+        logger.info(f"   - prop_desc: {count_words(prop_desc)} words")
+    if builder_details_desc:
+        logger.info(f"   - builder_details: {count_words(builder_details_desc)} words")
+    if builder_listing_desc:
+        logger.info(f"   - builder_listing: {count_words(builder_listing_desc)} words")
+    
     return output
-# ============= CALLBACK SENDER =============
 
 async def send_to_company_api(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Send generated content back to company API as form data"""
@@ -838,31 +1398,35 @@ async def process_data_background(body_data: Any, raw_body: bytes):
                 transformed_data = DataTransformer.transform(incoming_data)
                 logger.info("✅ Data transformed successfully")
                 
-                logger.info("🔄 Enhancing locality and developer content...")
-                enhanced_content = None
-                if enhance_property_content:
-                    enhanced_content = enhance_property_content(body_data)
-                
-                logger.info("🔄 Generating SEO content with OpenAI...")
-                seo_content = None
+                logger.info("🔄 Generating content (conditional based on word counts)...")
+                generated_content = None
                 seo_generation_error = None
                 try:
-                    seo_content = await generate_seo_content(transformed_data)
-                    logger.info("✅ SEO content generated")
+                    generated_content = await generate_seo_content(transformed_data)
+                    logger.info("✅ Content generation completed")
                 except Exception as e:
                     seo_generation_error = str(e)
                     logger.error(f"❌ Content generation failed: {seo_generation_error}")
-                    try:
-                        seo_content = get_fallback_seo_text_from_payload(body_data)
-                        logger.info("⚠️ Using fallback SEO content (from provided descriptions).")
-                    except Exception as e2:
-                        logger.error(f"❌ Failed to build fallback SEO content: {e2}")
-                        seo_content = f"{transformed_data.get('project_name')} - Brief description not available."
+                    # Use existing content as fallback
+                    generated_content = {
+                        "locality_description": transformed_data.get('locality_description'),
+                        "prop_locality_description": transformed_data.get('prop_locality_description'),
+                        "property_description": transformed_data.get('property_description'),
+                        "developer_details_description": transformed_data.get('developer_details_description'),
+                        "developer_listing_description": transformed_data.get('developer_listing_description'),
+                        "generation_skipped": False
+                    }
+                
+                # Combine property description with full SEO content if needed
+                if generated_content.get('property_description'):
+                    full_seo = generated_content['property_description']
+                else:
+                    full_seo = get_fallback_seo_text_from_payload(body_data)
                 
                 logger.info("🔄 Generating reviews...")
                 reviews = []
                 try:
-                    reviews = generate_reviews(seo_content, count=10)
+                    reviews = generate_reviews(full_seo, count=10)
                     logger.info(f"✅ Generated {len(reviews)} reviews")
                 except Exception as e:
                     logger.error(f"❌ Review generation failed: {e}")
@@ -871,7 +1435,7 @@ async def process_data_background(body_data: Any, raw_body: bytes):
                 logger.info("🔄 Generating FAQs...")
                 faqs = []
                 try:
-                    faqs = generate_faqs(transformed_data, seo_content)
+                    faqs = generate_faqs(transformed_data, full_seo)
                     logger.info(f"✅ Generated {len(faqs)} FAQs")
                 except Exception as e:
                     logger.error(f"❌ FAQ generation failed: {e}")
@@ -879,14 +1443,15 @@ async def process_data_background(body_data: Any, raw_body: bytes):
                 
                 formatted_output = format_output(
                     transformed_data,
-                    seo_content,
+                    generated_content,
                     reviews,
                     faqs,
-                    enhanced_content,
                     error_note=seo_generation_error
                 )
                 
                 logger.info("✅ Output formatted successfully")
+                
+                save_generated_data(formatted_output)
                 
                 callback_result = await send_to_company_api(formatted_output)
                 logger.info(f"📡 Callback result: {callback_result}")
@@ -920,8 +1485,6 @@ async def process_data_background(body_data: Any, raw_body: bytes):
             logger.error(f"❌ Failed to send failure notification: {send_err}")
 
 # ============= MAIN API ENDPOINT =============
-
-from pydantic import ValidationError
 
 @app.post("/process-property", status_code=200)
 async def process_property_data(request: Request, background_tasks: BackgroundTasks):
@@ -995,30 +1558,19 @@ async def generate_manual(request: Request):
         incoming_data = IncomingPropertyData(**body_data)
         transformed_data = DataTransformer.transform(incoming_data)
         
-        enhanced_content = None
-        if enhance_property_content:
-            enhanced_content = enhance_property_content(body_data)
+        generated_content = await generate_seo_content(transformed_data)
         
-        seo_content = None
-        seo_generation_error = None
-        try:
-            seo_content = await generate_seo_content(transformed_data)
-        except Exception as e:
-            seo_generation_error = str(e)
-            logger.error(f"❌ Manual SEO generation failed: {seo_generation_error}")
-            seo_content = get_fallback_seo_text_from_payload(body_data)
-            logger.info("⚠️ Using fallback SEO content for manual run.")
+        full_seo = generated_content.get('property_description') or get_fallback_seo_text_from_payload(body_data)
         
-        reviews = generate_reviews(seo_content, count=10)
-        faqs = generate_faqs(transformed_data, seo_content)
+        reviews = generate_reviews(full_seo, count=10)
+        faqs = generate_faqs(transformed_data, full_seo)
         
         formatted_output = format_output(
             transformed_data,
-            seo_content,
+            generated_content,
             reviews,
             faqs,
-            enhanced_content,
-            error_note=seo_generation_error
+            error_note=None
         )
         
         return formatted_output
@@ -1035,21 +1587,26 @@ async def generate_manual(request: Request):
 @app.get("/")
 async def root():
     return {
-        "service": "Property Content Generator API - Enhanced with FAQ (OpenAI)",
-        "version": "7.0.0",
+        "service": "Property Content Generator API - Smart Version",
+        "version": "9.0.0",
         "ai_model": "OpenAI GPT-4o-mini",
         "status": "operational",
-        "mode": "API-driven with formatted output + FAQs",
+        "features": [
+            "Smart content validation (250+ words)",
+            "Conditional generation (only generates what's needed)",
+            "No dash symbols in output",
+            "Validates: LocalityDiscription, Property_LocalityDiscription, property_description, builder_details_desc, builder_listing_desc"
+        ],
         "output_format": {
             "propid": "string",
             "prop_name": "string",
-            "prop_desc": "<p>SEO content in paragraph tags</p>",
+            "prop_desc": "Clean HTML",
             "localityid": "string",
-            "locality_desc": "string",
-            "prop_locality_desc": "string",
+            "locality_desc": "Clean HTML (existing or generated)",
+            "prop_locality_desc": "Clean HTML (existing or generated)",
             "builderid": "string",
-            "builder_desc_details": "string",
-            "builder_desc_listing": "string",
+            "builder_desc_details": "Clean HTML (existing or generated)",
+            "builder_desc_listing": "Clean HTML (existing or generated)",
             "reviews": "array",
             "FAQ": "array"
         },
@@ -1065,8 +1622,8 @@ async def health_check():
         "timestamp": datetime.now().isoformat(),
         "openai_ready": True,
         "review_generator_ready": generate_reviews_from_text is not None,
-        "loc_build_ready": enhance_property_content is not None,
         "faq_generator_ready": True,
+        "smart_validation": True,
         "callback_api": COMPANY_CALLBACK_API
     }
 
@@ -1082,30 +1639,19 @@ async def process_property_debug(request: Request):
 
         transformed_data = DataTransformer.transform(incoming_data)
 
-        enhanced_content = None
-        if enhance_property_content:
-            enhanced_content = enhance_property_content(body_data)
+        generated_content = await generate_seo_content(transformed_data)
+        
+        full_seo = generated_content.get('property_description') or get_fallback_seo_text_from_payload(body_data)
 
-        seo_content = None
-        seo_generation_error = None
-        try:
-            seo_content = await generate_seo_content(transformed_data)
-        except Exception as e:
-            seo_generation_error = str(e)
-            logger.error(f"❌ Debug SEO generation failed: {seo_generation_error}")
-            seo_content = get_fallback_seo_text_from_payload(body_data)
-            logger.info("⚠️ Debug: Using fallback SEO content.")
-
-        reviews = generate_reviews(seo_content, count=10)
-        faqs = generate_faqs(transformed_data, seo_content)
+        reviews = generate_reviews(full_seo, count=10)
+        faqs = generate_faqs(transformed_data, full_seo)
 
         formatted_output = format_output(
             transformed_data,
-            seo_content,
+            generated_content,
             reviews,
             faqs,
-            enhanced_content,
-            error_note=seo_generation_error
+            error_note=None
         )
 
         callback_result = await send_to_company_api(formatted_output)
@@ -1119,6 +1665,13 @@ async def process_property_debug(request: Request):
             "callback_result": callback_result,
             "payload": formatted_output,
             "payload_size_bytes": len(json.dumps(formatted_output)),
+            "generation_summary": {
+                "locality": "GENERATED" if transformed_data['locality_needs_generation'] else "EXISTING",
+                "prop_locality": "GENERATED" if transformed_data['prop_locality_needs_generation'] else "EXISTING",
+                "property": "GENERATED" if transformed_data['property_needs_generation'] else "EXISTING",
+                "dev_details": "GENERATED" if transformed_data['developer_details_needs_generation'] else "EXISTING",
+                "dev_listing": "GENERATED" if transformed_data['developer_listing_needs_generation'] else "EXISTING"
+            },
             "timestamp": datetime.now().isoformat(),
         }
 
@@ -1140,28 +1693,19 @@ async def test_callback(request: Request):
         incoming_data = IncomingPropertyData(**body_data)
         transformed_data = DataTransformer.transform(incoming_data)
         
-        enhanced_content = None
-        if enhance_property_content:
-            enhanced_content = enhance_property_content(body_data)
+        generated_content = await generate_seo_content(transformed_data)
         
-        seo_content = None
-        seo_generation_error = None
-        try:
-            seo_content = await generate_seo_content(transformed_data)
-        except Exception as e:
-            seo_generation_error = str(e)
-            logger.error(f"❌ Test-callback SEO generation failed: {seo_generation_error}")
-            seo_content = get_fallback_seo_text_from_payload(body_data)
-            logger.info("⚠️ Using fallback SEO content for test-callback.")
+        full_seo = generated_content.get('property_description') or get_fallback_seo_text_from_payload(body_data)
         
-        reviews = generate_reviews(seo_content, count=10)
+        reviews = generate_reviews(full_seo, count=10)
+        faqs = generate_faqs(transformed_data, full_seo)
         
         formatted_output = format_output(
             transformed_data,
-            seo_content,
+            generated_content,
             reviews,
-            enhanced_content,
-            error_note=seo_generation_error
+            faqs,
+            error_note=None
         )
         
         return {
@@ -1172,6 +1716,13 @@ async def test_callback(request: Request):
             "payload": formatted_output,
             "payload_size_bytes": len(json.dumps(formatted_output)),
             "payload_keys": list(formatted_output.keys()),
+            "generation_summary": {
+                "locality": "GENERATED" if transformed_data['locality_needs_generation'] else "EXISTING (250+ words)",
+                "prop_locality": "GENERATED" if transformed_data['prop_locality_needs_generation'] else "EXISTING (250+ words)",
+                "property": "GENERATED" if transformed_data['property_needs_generation'] else "EXISTING (250+ words)",
+                "dev_details": "GENERATED" if transformed_data['developer_details_needs_generation'] else "EXISTING (250+ words)",
+                "dev_listing": "GENERATED" if transformed_data['developer_listing_needs_generation'] else "EXISTING (250+ words)"
+            },
             "timestamp": datetime.now().isoformat()
         }
         
@@ -1184,16 +1735,18 @@ async def test_callback(request: Request):
 
 if __name__ == "__main__":
     import uvicorn
-    print("🚀 Starting Enhanced Property Content Generator (OpenAI)...")
+    print("🚀 Starting Property Content Generator API (Smart Version)...")
     print("🤖 AI Model: OpenAI GPT-4o-mini")
     print("📍 Server: http://localhost:8000")
     print("📚 API Docs: http://localhost:8000/docs")
     print(f"📤 Callback API: {COMPANY_CALLBACK_API}")
-    print("\n✨ OUTPUT FORMAT:")
-    print("   - propid, prop_name, prop_desc (in <p> tags)")
-    print("   - localityid, locality_desc, prop_locality_desc")
-    print("   - builderid, builder_desc_details, builder_desc_listing")
-    print("   - reviews (array)")
+    print("\n✨ SMART FEATURES:")
+    print("   ✓ Content validation (250+ words threshold)")
+    print("   ✓ Conditional generation (only generates what's needed)")
+    print("   ✓ No dash symbols in output")
+    print("   ✓ Clean HTML formatting")
+    print("   ✓ Validates: LocalityDiscription, Property_LocalityDiscription")
+    print("   ✓ Validates: property_description, builder_details_desc, builder_listing_desc")
     uvicorn.run(
         app, 
         host="0.0.0.0", 
